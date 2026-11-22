@@ -19,6 +19,7 @@ manual-changelog:
 # Kept in the repo, but not part of the addon. Dot files (.git, .gitignore,
 # .pkgmeta) are left out automatically.
 ignore:
+  - README.md
   - CURSEFORGE.md
   - ttc_logo.png
 
