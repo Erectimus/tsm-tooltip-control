@@ -1,0 +1,16 @@
+## Interface: 16001
+## Title: TSM Tooltip Control
+## Notes: Organize TradeSkillMaster tooltip datapoints under your own headings.
+## Author: Collin Ferguson
+## Version: @project-version@
+## SavedVariables: TSMTooltipControlDB
+## Category-enUS: Auctions
+
+# No Dependency on TradeSkillMaster on purpose: this addon must load BEFORE TSM
+# so its tooltip capture hook is registered ahead of TSM's (the leading "!" in
+# the folder name makes it sort first). See Capture.lua.
+
+Core.lua
+Layout.lua
+Capture.lua
+Options.lua

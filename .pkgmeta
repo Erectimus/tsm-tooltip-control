@@ -1,0 +1,29 @@
+# CurseForge automatic packaging
+# https://support.curseforge.com/support/solutions/articles/9000197281-automatic-packaging
+#
+# Pushing a tag builds a file on CurseForge. The tag name becomes the version
+# (@project-version@ in the .toc) and picks the release type:
+#   0.2.0          -> release
+#   0.2.0-beta1    -> beta   (tag contains "beta")
+#   0.2.0-alpha1   -> alpha  (tag contains "alpha")
+
+# The folder inside the zip. The leading "!" is required: it makes this addon
+# load before TradeSkillMaster (see Capture.lua).
+package-as: "!TSMTooltipControl"
+
+# The notes shown for the new file on CurseForge. Write them before tagging.
+manual-changelog:
+  filename: CHANGELOG.md
+  markup-type: markdown
+
+# Kept in the repo, but not part of the addon. Dot files (.git, .gitignore,
+# .pkgmeta) are left out automatically.
+ignore:
+  - CURSEFORGE.md
+  - ttc_logo.png
+
+# TradeSkillMaster isn't a hard requirement in the .toc (this addon has to load
+# before it), but it could be listed as a relation on CurseForge. Uncomment
+# once you've confirmed TSM's CurseForge slug.
+# optional-dependencies:
+#   - tradeskill-master
