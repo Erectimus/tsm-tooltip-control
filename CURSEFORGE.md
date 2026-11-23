@@ -52,18 +52,23 @@ Profit
 
 1. Hover over a few items so the addon can see which datapoints TSM shows you.
 2. Type `/ttc`, or open Esc > Options > AddOns > TSM Tooltip Control.
-3. Click **New** to create a heading.
-4. Double-click datapoints in the right-hand list to add them to it.
+3. Click **New Heading** to create a heading.
+4. Drag datapoints from the right-hand list into it.
 5. Hover an item again to see your new layout.
 
 ### In the options panel
 
-- **Double-click** an available datapoint to add it to the selected heading. Double-click it again to take it back out.
+**Your layout** on the left shows your headings in tooltip order, with each heading's datapoints listed under it.
+
+- **Drag** a datapoint into a heading, or to a new spot in the same heading. Drag it into **(Hidden)** to never show it, or back to the right-hand list to take it out of your layout.
+- **Drag a datapoint between two headings** to show it at heading level, as if it were its own heading.
+- **Drag headings and spacers** to reorder them.
+- **Double-click** a heading or datapoint to rename it.
 - **Rename** changes a heading's or datapoint's label.
 - **Spacer** adds a blank line below the selected heading.
 - **Mute** shows a datapoint in gray. Click **Unmute** to bring back its normal colors.
+- **Hide** moves a datapoint to (Hidden). **Unhide** puts it back.
 - **Show at Heading Level** turns a single datapoint into its own heading-level line.
-- **Up / Down** reorder your headings, spacers and promoted datapoints.
 
 Type `/ttc off` and `/ttc on` to switch the addon off and on.
 

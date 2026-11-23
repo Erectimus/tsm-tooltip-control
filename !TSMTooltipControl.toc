@@ -11,6 +11,7 @@
 # the folder name makes it sort first). See Capture.lua.
 
 Core.lua
+TSMSettings.lua
 Layout.lua
 Capture.lua
 Options.lua

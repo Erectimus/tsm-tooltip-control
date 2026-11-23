@@ -2,26 +2,50 @@ local _, ns = ...
 
 -- Options panel: Esc > Options > AddOns > TSM Tooltip Control
 --
---  [Your headings]        [Datapoints in heading]   [Available datapoints]
---   (Hidden)               Min Buyout                TSM AuctionDB
---   Prices                 Market Value                Region Market Avg
---   ...                    ...                       TSM General Info ...
+--  [Your layout]                         [Available datapoints]
+--   Prices                                TSM AuctionDB
+--     Min Buyout                            Region Market Avg
+--     Market Value                        TSM General Info
+--   - - - spacer - - -                      ...
+--   > Disenchant Value
+--   (Hidden)
+--     Region Sale Avg
+--
+-- Everything is moved by dragging: datapoints into a heading, between
+-- headings (shown at heading level), into (Hidden) or back to Available;
+-- headings and spacers up and down.
 
-local COLUMN_WIDTH = 196
+local TREE_WIDTH = 372
+local AVAILABLE_WIDTH = 228
 local COLUMN_GAP = 12
+local TOTAL_WIDTH = TREE_WIDTH + COLUMN_GAP + AVAILABLE_WIDTH
 local LIST_HEIGHT = 300
 local ROW_HEIGHT = 18
-local HIDDEN_KEY = 0
+local HIDDEN_KEY = 0 -- list key for the hidden datapoints (heading keys start at 1)
+local HEADING_INDENT = 4
+local POINT_INDENT = 20
+local AUTOSCROLL_EDGE = 20
+local AUTOSCROLL_SPEED = 300
+
+local GOLD = { 1, 0.82, 0 }
+local WHITE = { 1, 1, 1 }
+local GRAY = { 0.5, 0.5, 0.5 }
+local DIM = { 0.4, 0.4, 0.4 }
 
 local BACKDROP_TEMPLATE = BackdropTemplateMixin and "BackdropTemplate" or nil
+local LIST_BACKDROP = {
+	bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
+	edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+	edgeSize = 12,
+	insets = { left = 3, right = 3, top = 3, bottom = 3 },
+}
 
 local canvas = CreateFrame("Frame")
 canvas.name = ns.TITLE
 canvas:Hide()
 
-local selectedHeading = nil -- HIDDEN_KEY or heading index
-local selectedAssigned = nil -- datapoint id
-local selectedAvailable = nil -- datapoint id
+-- The selected row: a datapoint id (string) or a heading / spacer entry (table)
+local selected = nil
 local Refresh -- forward declaration
 
 -- ============================================================================
@@ -43,7 +67,7 @@ local function DisplayName(id)
 	return ns.GetRename(id) or label, section, label
 end
 
----Text and tooltip for a datapoint row in either datapoint list.
+---Row for a datapoint in either list.
 local function DatapointRow(id, indent)
 	local name, section, original = DisplayName(id)
 	local text, tooltip = name, section and ("From " .. section) or nil
@@ -55,22 +79,16 @@ local function DatapointRow(id, indent)
 	if muted then
 		tooltip = (tooltip and (tooltip .. "\n") or "") .. "Shown muted"
 	end
-	return { key = id, text = text, color = muted and { 0.5, 0.5, 0.5 } or { 1, 1, 1 }, indent = indent, tooltip = tooltip, sortName = name }
-end
-
-local function GetSelectedList()
-	if selectedHeading == HIDDEN_KEY then
-		return ns.db.hidden
-	end
-	local heading = selectedHeading and ns.db.headings[selectedHeading]
-	if not heading or heading.spacer or heading.standalone then
-		return nil
-	end
-	return heading.items
-end
-
-local function GetSelectedHeading()
-	return selectedHeading and selectedHeading ~= HIDDEN_KEY and ns.db.headings[selectedHeading] or nil
+	return {
+		text = text,
+		tooltipTitle = name,
+		tooltip = tooltip,
+		color = muted and GRAY or WHITE,
+		indent = indent,
+		sel = id,
+		drag = { id = id },
+		sortName = name,
+	}
 end
 
 local function IndexOf(list, value)
@@ -81,9 +99,56 @@ local function IndexOf(list, value)
 	end
 end
 
+---The heading entry list or hidden list a datapoint list key refers to.
+local function ListFor(key)
+	if key == HIDDEN_KEY then
+		return ns.db.hidden
+	end
+	return ns.db.headings[key].items
+end
+
+---Index of the standalone entry showing `id`, if any.
+local function StandaloneIndex(id)
+	for index, heading in ipairs(ns.db.headings) do
+		if heading.standalone and heading.items[1] == id then
+			return index
+		end
+	end
+end
+
+local function SelectedEntry()
+	return type(selected) == "table" and selected or nil
+end
+
+local function SelectedId()
+	return type(selected) == "string" and selected or nil
+end
+
+---Index in the headings list of the selected entry, or of the heading the
+---selected datapoint is in. Nil for available or hidden datapoints.
+local function SelectedBlockIndex()
+	local entry = SelectedEntry()
+	if entry then
+		return IndexOf(ns.db.headings, entry)
+	end
+	local id = SelectedId()
+	local where = id and ns.GetAssignment()[id]
+	return type(where) == "number" and where or nil
+end
+
 local function Changed()
 	ns.InvalidateLayout()
 	Refresh()
+end
+
+local function SetTooltip(frame, title, body)
+	frame:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText(type(title) == "function" and title(self) or title, 1, 1, 1)
+		GameTooltip:AddLine(type(body) == "function" and body(self) or body, nil, nil, nil, true)
+		GameTooltip:Show()
+	end)
+	frame:SetScript("OnLeave", GameTooltip_Hide)
 end
 
 local function CreateButton(parent, text, width, onClick)
@@ -107,13 +172,7 @@ local function CreateCheckbox(parent, text, tooltipText, getter, setter)
 		setter(self:GetChecked() and true or false)
 		Changed()
 	end)
-	check:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText(text, 1, 1, 1)
-		GameTooltip:AddLine(tooltipText, nil, nil, nil, true)
-		GameTooltip:Show()
-	end)
-	check:SetScript("OnLeave", GameTooltip_Hide)
+	SetTooltip(check, text, tooltipText)
 	check.Update = function(self)
 		self:SetChecked(getter())
 	end
@@ -191,19 +250,182 @@ local function Confirm(prompt, callback)
 end
 
 -- ============================================================================
+-- Moving things (used by drag and drop)
+-- ============================================================================
+
+---Moves a heading or spacer to `index` in the headings list (before the entry
+---currently there).
+local function MoveEntry(entry, index)
+	local headings = ns.db.headings
+	local from = IndexOf(headings, entry)
+	if not from then
+		return
+	end
+	if from < index then
+		index = index - 1
+	end
+	tremove(headings, from)
+	tinsert(headings, min(max(index, 1), #headings + 1), entry)
+end
+
+---Shows a datapoint at heading level at `index` in the headings list.
+local function MovePointToTop(id, index)
+	local from = StandaloneIndex(id)
+	if from and from < index then
+		-- AddStandalone removes the old entry first, which shifts the ones after it
+		index = index - 1
+	end
+	ns.AddStandalone(id, index)
+end
+
+---Moves a datapoint to position `pos` of a heading's list or the hidden list.
+local function MovePointInto(id, key, pos)
+	local list = ListFor(key)
+	local from = IndexOf(list, id)
+	if from and from < pos then
+		pos = pos - 1
+	end
+	-- `list` stays valid even if Unassign removes a standalone entry before it
+	ns.Unassign(id)
+	tinsert(list, min(max(pos, 1), #list + 1), id)
+end
+
+-- ============================================================================
+-- Actions
+-- ============================================================================
+
+---Where new headings, spacers and heading-level datapoints go: below the
+---selected heading (or the heading of the selected datapoint), else at the end.
+local function InsertIndex()
+	local index = SelectedBlockIndex()
+	return index and (index + 1) or (#ns.db.headings + 1)
+end
+
+local function NewHeading()
+	PromptName("Name for the new heading:", "", function(name)
+		local entry = { name = name, items = {} }
+		tinsert(ns.db.headings, InsertIndex(), entry)
+		selected = entry
+		Changed()
+	end)
+end
+
+local function NewSpacer()
+	local entry = { spacer = true, items = {} }
+	tinsert(ns.db.headings, InsertIndex(), entry)
+	selected = entry
+	Changed()
+end
+
+local function RenameDatapoint(id)
+	local name, _, original = DisplayName(id)
+	PromptName(format("Rename \"%s\":\n(leave empty to use TSM's name)", original), name, function(newName)
+		ns.SetRename(id, newName ~= original and newName or nil)
+		Refresh()
+	end, true)
+end
+
+local function RenameHeading(entry)
+	PromptName("Rename heading:", entry.name, function(name)
+		entry.name = name
+		Changed()
+	end)
+end
+
+local function RenameSelected()
+	local entry = SelectedEntry()
+	if entry and not entry.spacer then
+		RenameHeading(entry)
+	elseif SelectedId() then
+		RenameDatapoint(SelectedId())
+	end
+end
+
+local function DeleteEntry(entry)
+	local function Delete()
+		local index = IndexOf(ns.db.headings, entry)
+		if index then
+			tremove(ns.db.headings, index)
+		end
+		selected = nil
+		Changed()
+	end
+	if entry.spacer or #entry.items == 0 then
+		Delete()
+	else
+		Confirm(format("Delete the heading \"%s\"?\nIts datapoints go back to Available.", entry.name), Delete)
+	end
+end
+
+---Delete for headings and spacers, Remove (back to Available) for datapoints.
+local function DeleteSelected()
+	local entry = SelectedEntry()
+	if entry then
+		DeleteEntry(entry)
+	elseif SelectedId() and ns.GetAssignment()[SelectedId()] ~= nil then
+		ns.Unassign(SelectedId())
+		Changed()
+	end
+end
+
+local function PromoteSelected()
+	local id = SelectedId()
+	if not id or StandaloneIndex(id) then
+		return
+	end
+	ns.AddStandalone(id, InsertIndex())
+	Changed()
+end
+
+local function ToggleMutedSelected()
+	local id = SelectedId()
+	if id then
+		ns.SetMuted(id, not ns.IsMuted(id))
+		Refresh()
+	end
+end
+
+local function ToggleHiddenSelected()
+	local id = SelectedId()
+	if not id then
+		return
+	end
+	local wasHidden = ns.GetAssignment()[id] == true
+	ns.Unassign(id)
+	if not wasHidden then
+		tinsert(ns.db.hidden, id)
+	end
+	Changed()
+end
+
+local function ForgetSelected()
+	local id = SelectedId()
+	if id and ns.GetAssignment()[id] == nil then
+		ns.db.catalog[id] = nil
+		selected = nil
+		Refresh()
+	end
+end
+
+-- ============================================================================
 -- Scrolling list widget
 -- ============================================================================
 
-local function CreateList(parent, titleText, onSelect, onDoubleClick)
+local drag = nil -- { id = id } or { entry = heading }, while dragging
+local StartDrag, FinishDrag -- defined with the drag and drop code below
+
+---Item fields:
+---  text, color, font, indent  how the row looks
+---  sel        selection key: a datapoint id or a heading entry
+---  drag       what dragging the row moves: { id = id } or { entry = heading }
+---  drop       what the row means as a drop target (layout list only)
+---  inert      not clickable (section names, placeholders)
+---  tooltipTitle, tooltip
+local function CreateList(parent, titleText, width, onDoubleClick)
 	local list = CreateFrame("Frame", nil, parent, BACKDROP_TEMPLATE)
-	list:SetSize(COLUMN_WIDTH, LIST_HEIGHT)
+	list:SetSize(width, LIST_HEIGHT)
 	if list.SetBackdrop then
-		list:SetBackdrop({
-			bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
-			edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-			edgeSize = 12,
-			insets = { left = 3, right = 3, top = 3, bottom = 3 },
-		})
+		list:SetBackdrop(LIST_BACKDROP)
 		list:SetBackdropColor(0, 0, 0, 0.5)
 		list:SetBackdropBorderColor(0.4, 0.4, 0.4)
 	end
@@ -217,8 +439,10 @@ local function CreateList(parent, titleText, onSelect, onDoubleClick)
 	scroll:SetPoint("TOPLEFT", 5, -5)
 	scroll:SetPoint("BOTTOMRIGHT", -27, 5)
 	local content = CreateFrame("Frame", nil, scroll)
-	content:SetSize(COLUMN_WIDTH - 32, 1)
+	content:SetSize(width - 32, 1)
 	scroll:SetScrollChild(content)
+	list.scroll = scroll
+	list.content = content
 
 	local empty = list:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
 	empty:SetPoint("TOPLEFT", 10, -10)
@@ -230,23 +454,34 @@ local function CreateList(parent, titleText, onSelect, onDoubleClick)
 	list.items = {}
 
 	local function OnRowClick(row)
-		if row.item and not row.item.isHeader then
-			onSelect(row.item.key)
+		if row.item and row.item.sel ~= nil then
+			selected = row.item.sel
+			Refresh()
 		end
 	end
 
 	local function OnRowDoubleClick(row)
-		if row.item and not row.item.isHeader and onDoubleClick then
-			onDoubleClick(row.item.key)
+		if row.item and row.item.sel ~= nil and onDoubleClick then
+			selected = row.item.sel
+			onDoubleClick()
 		end
 	end
 
 	local function OnRowEnter(row)
-		if row.item and row.item.tooltip then
-			GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
-			GameTooltip:SetText(row.item.text, 1, 1, 1)
-			GameTooltip:AddLine(row.item.tooltip, nil, nil, nil, true)
-			GameTooltip:Show()
+		if drag or not (row.item and row.item.tooltip) then
+			return
+		end
+		GameTooltip:SetOwner(row, "ANCHOR_RIGHT")
+		GameTooltip:SetText(row.item.tooltipTitle or row.item.text, 1, 1, 1)
+		GameTooltip:AddLine(row.item.tooltip, nil, nil, nil, true)
+		GameTooltip:Show()
+	end
+
+	local function OnRowDragStart(row)
+		if row.item and row.item.drag then
+			selected = row.item.sel
+			Refresh()
+			StartDrag(row.item.drag, row.item.text)
 		end
 	end
 
@@ -260,6 +495,7 @@ local function CreateList(parent, titleText, onSelect, onDoubleClick)
 		row:SetPoint("TOPLEFT", 0, -(index - 1) * ROW_HEIGHT)
 		row:SetPoint("RIGHT", content, "RIGHT")
 		row:RegisterForClicks("LeftButtonUp")
+		row:RegisterForDrag("LeftButton")
 
 		local highlight = row:CreateTexture(nil, "HIGHLIGHT")
 		highlight:SetAllPoints()
@@ -279,32 +515,24 @@ local function CreateList(parent, titleText, onSelect, onDoubleClick)
 		row:SetScript("OnDoubleClick", OnRowDoubleClick)
 		row:SetScript("OnEnter", OnRowEnter)
 		row:SetScript("OnLeave", GameTooltip_Hide)
+		row:SetScript("OnDragStart", OnRowDragStart)
+		row:SetScript("OnDragStop", function() FinishDrag() end)
 		list.rows[index] = row
 		return row
 	end
 
-	---@param items table[] { key = any, text = string, isHeader = bool?, color = {r,g,b}?, tooltip = string? }
-	function list:SetItems(items, selectedKey, emptyText)
+	function list:SetItems(items, emptyText)
 		self.items = items
 		for i, item in ipairs(items) do
 			local row = GetRow(i)
 			row.item = item
+			row.text:SetFontObject(item.font or "GameFontHighlightSmall")
 			row.text:SetText(item.text)
-			if item.isHeader then
-				row.text:SetFontObject("GameFontNormalSmall")
-				row.text:SetTextColor(1, 0.82, 0)
-				row.text:SetPoint("LEFT", 2, 0)
-				row:EnableMouse(false)
-			else
-				row.text:SetFontObject("GameFontHighlightSmall")
-				row.text:SetPoint("LEFT", item.indent and 12 or 4, 0)
-				row:EnableMouse(true)
-			end
-			local color = item.color
-			if color then
-				row.text:SetTextColor(color[1], color[2], color[3])
-			end
-			row.selected:SetShown(not item.isHeader and selectedKey ~= nil and item.key == selectedKey)
+			row.text:SetPoint("LEFT", item.indent or HEADING_INDENT, 0)
+			local color = item.color or WHITE
+			row.text:SetTextColor(color[1], color[2], color[3])
+			row:EnableMouse(not item.inert)
+			row.selected:SetShown(item.sel ~= nil and item.sel == selected)
 			row:Show()
 		end
 		for i = #items + 1, #self.rows do
@@ -319,167 +547,6 @@ local function CreateList(parent, titleText, onSelect, onDoubleClick)
 end
 
 -- ============================================================================
--- Actions
--- ============================================================================
-
-local function NewHeading()
-	PromptName("Name for the new heading:", "", function(name)
-		tinsert(ns.db.headings, { name = name, items = {} })
-		selectedHeading = #ns.db.headings
-		selectedAssigned = nil
-		Changed()
-	end)
-end
-
-local function NewSpacer()
-	-- Insert below the selected heading, or at the end
-	local index = GetSelectedHeading() and (selectedHeading + 1) or (#ns.db.headings + 1)
-	tinsert(ns.db.headings, index, { spacer = true, items = {} })
-	selectedHeading = index
-	selectedAssigned = nil
-	Changed()
-end
-
-local function RenameDatapoint(id)
-	if not id then
-		return
-	end
-	local name, _, original = DisplayName(id)
-	PromptName(format("Rename \"%s\":\n(leave empty to use TSM's name)", original), name, function(newName)
-		ns.SetRename(id, newName ~= original and newName or nil)
-		Refresh()
-	end, true)
-end
-
-local function RenameHeading()
-	local heading = GetSelectedHeading()
-	if not heading or heading.spacer then
-		return
-	elseif heading.standalone then
-		RenameDatapoint(heading.items[1])
-		return
-	end
-	PromptName("Rename heading:", heading.name, function(name)
-		heading.name = name
-		Changed()
-	end)
-end
-
-local function DeleteHeading()
-	local heading = selectedHeading and ns.db.headings[selectedHeading]
-	if not heading then
-		return
-	end
-	local index = selectedHeading
-	local function Delete()
-		tremove(ns.db.headings, index)
-		selectedHeading = nil
-		selectedAssigned = nil
-		Changed()
-	end
-	if heading.spacer or heading.standalone or #heading.items == 0 then
-		-- Nothing to lose: a standalone datapoint just goes back to the available list
-		Delete()
-	else
-		Confirm(format("Delete the heading \"%s\"?\nIts datapoints go back to their TSM headings.", heading.name), Delete)
-	end
-end
-
-local function MoveHeading(delta)
-	local headings = ns.db.headings
-	local index = selectedHeading
-	if not index or index == HIDDEN_KEY then
-		return
-	end
-	local target = index + delta
-	if target < 1 or target > #headings then
-		return
-	end
-	headings[index], headings[target] = headings[target], headings[index]
-	selectedHeading = target
-	Changed()
-end
-
-local function MoveAssigned(delta)
-	local list = GetSelectedList()
-	local index = list and selectedAssigned and IndexOf(list, selectedAssigned)
-	if not index then
-		return
-	end
-	local target = index + delta
-	if target < 1 or target > #list then
-		return
-	end
-	list[index], list[target] = list[target], list[index]
-	Changed()
-end
-
-local function RemoveAssigned(id)
-	id = id or selectedAssigned
-	if not id then
-		return
-	end
-	ns.Unassign(id)
-	selectedAssigned = nil
-	selectedAvailable = id
-	Changed()
-end
-
-local function AddAvailable(id)
-	id = id or selectedAvailable
-	local list = GetSelectedList()
-	if not id or not list then
-		if not list then
-			ns.Print("select or create a heading first.")
-		end
-		return
-	end
-	ns.Unassign(id)
-	tinsert(list, id)
-	selectedAvailable = nil
-	selectedAssigned = id
-	Changed()
-end
-
-local function PromoteDatapoint(id)
-	if not id then
-		return
-	end
-	-- Insert below the selected entry in the headings list, or at the end
-	local index = GetSelectedHeading() and (selectedHeading + 1) or nil
-	selectedHeading = ns.AddStandalone(id, index)
-	selectedAssigned, selectedAvailable = nil, nil
-	Changed()
-end
-
-local function ToggleMuted(id)
-	if not id then
-		return
-	end
-	ns.SetMuted(id, not ns.IsMuted(id))
-	Refresh()
-end
-
----The datapoint the middle column's buttons act on: the selected datapoint, or
----the datapoint of a selected heading-level entry.
-local function GetAssignedTarget()
-	if selectedAssigned then
-		return selectedAssigned
-	end
-	local heading = GetSelectedHeading()
-	return heading and heading.standalone and heading.items[1] or nil
-end
-
-local function ForgetAvailable()
-	if not selectedAvailable then
-		return
-	end
-	ns.db.catalog[selectedAvailable] = nil
-	selectedAvailable = nil
-	Refresh()
-end
-
--- ============================================================================
 -- Layout
 -- ============================================================================
 
@@ -489,15 +556,15 @@ title:SetText(ns.TITLE)
 
 local subtitle = canvas:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
-subtitle:SetWidth(COLUMN_WIDTH * 3 + COLUMN_GAP * 2)
+subtitle:SetWidth(TOTAL_WIDTH)
 subtitle:SetJustifyH("LEFT")
-subtitle:SetText("Create your own headings and move TSM datapoints into them. "
+subtitle:SetText("Create your own headings and drag TSM datapoints into them. "
 	.. "Which datapoints appear at all is still controlled in TSM > Settings > Tooltip Settings. "
 	.. "Datapoints show up in the right-hand list after you've seen them on an item tooltip. "
 	.. "Requires TSM's \"Embed TSM tooltip\" option.")
 
 local enabledCheck = CreateCheckbox(canvas, "Enabled",
-	"Rearrange TSM's tooltip lines using the headings below.",
+	"Rearrange TSM's tooltip lines using your layout below.",
 	function() return ns.db.enabled end,
 	function(value) ns.db.enabled = value end)
 enabledCheck:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", -4, -10)
@@ -508,123 +575,69 @@ local unassignedCheck = CreateCheckbox(canvas, "Show unassigned datapoints under
 	function(value) ns.db.showUnassigned = value end)
 unassignedCheck:SetPoint("LEFT", enabledCheck, "RIGHT", 90, 0)
 
-local headingList = CreateList(canvas, "Your headings",
-	function(key)
-		selectedHeading = key
-		selectedAssigned = nil
-		Refresh()
-	end,
-	function(key)
-		if key ~= HIDDEN_KEY then
-			selectedHeading = key
-			RenameHeading()
-		end
+local keepPlacementCheck = CreateCheckbox(canvas, "Remember where datapoints switched off in TSM were placed",
+	"When checked, a datapoint you switch off in TSM > Settings > Tooltip Settings keeps its place in your layout "
+	.. "and goes back there when you switch it on again.\n\n"
+	.. "When unchecked, it's taken out of your layout, and you place it again after switching it back on.",
+	function() return ns.db.keepDisabledPlacement end,
+	function(value)
+		ns.db.keepDisabledPlacement = value
+		ns.ForgetInactivePlacements()
 	end)
-headingList:SetPoint("TOPLEFT", enabledCheck, "BOTTOMLEFT", 4, -26)
+keepPlacementCheck:SetPoint("TOPLEFT", enabledCheck, "BOTTOMLEFT", 0, 0)
 
-local assignedList = CreateList(canvas, "Datapoints in heading",
-	function(key)
-		selectedAssigned = key
-		Refresh()
-	end,
-	RemoveAssigned)
-assignedList:SetPoint("TOPLEFT", headingList, "TOPRIGHT", COLUMN_GAP, 0)
+local tree = CreateList(canvas, "Your layout", TREE_WIDTH, RenameSelected)
+tree:SetPoint("TOPLEFT", keepPlacementCheck, "BOTTOMLEFT", 4, -26)
 
-local availableList = CreateList(canvas, "Available datapoints",
-	function(key)
-		selectedAvailable = key
-		Refresh()
-	end,
-	AddAvailable)
-availableList:SetPoint("TOPLEFT", assignedList, "TOPRIGHT", COLUMN_GAP, 0)
+local availableList = CreateList(canvas, "Available datapoints", AVAILABLE_WIDTH, RenameSelected)
+availableList:SetPoint("TOPLEFT", tree, "TOPRIGHT", COLUMN_GAP, 0)
 
-local HALF = (COLUMN_WIDTH - 4) / 2
-local THIRD = (COLUMN_WIDTH - 8) / 3
-
-local newButton = CreateButton(canvas, "New", THIRD, NewHeading)
-newButton:SetPoint("TOPLEFT", headingList, "BOTTOMLEFT", 0, -6)
-local spacerButton = CreateButton(canvas, "Spacer", THIRD, NewSpacer)
+-- Buttons below the layout. They act on the selected row, in either list.
+local newButton = CreateButton(canvas, "New Heading", 108, NewHeading)
+newButton:SetPoint("TOPLEFT", tree, "BOTTOMLEFT", 0, -6)
+SetTooltip(newButton, "New Heading", "Adds a heading below the selected one, or at the end.")
+local spacerButton = CreateButton(canvas, "Spacer", 80, NewSpacer)
 spacerButton:SetPoint("LEFT", newButton, "RIGHT", 4, 0)
-spacerButton:SetScript("OnEnter", function(self)
-	GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-	GameTooltip:SetText("Add Spacer", 1, 1, 1)
-	GameTooltip:AddLine("Adds one blank line between the headings around it. Spacers with nothing below or above them are skipped.", nil, nil, nil, true)
-	GameTooltip:Show()
-end)
-spacerButton:SetScript("OnLeave", GameTooltip_Hide)
-local renameButton = CreateButton(canvas, "Rename", THIRD, RenameHeading)
+SetTooltip(spacerButton, "Add Spacer",
+	"Adds one blank line below the selected heading, or at the end. Spacers with nothing below or above them are skipped.")
+local renameButton = CreateButton(canvas, "Rename", 88, RenameSelected)
 renameButton:SetPoint("LEFT", spacerButton, "RIGHT", 4, 0)
-local deleteButton = CreateButton(canvas, "Delete", THIRD, DeleteHeading)
-deleteButton:SetPoint("TOPLEFT", newButton, "BOTTOMLEFT", 0, -4)
-local headingUpButton = CreateButton(canvas, "Up", THIRD, function() MoveHeading(-1) end)
-headingUpButton:SetPoint("LEFT", deleteButton, "RIGHT", 4, 0)
-local headingDownButton = CreateButton(canvas, "Down", THIRD, function() MoveHeading(1) end)
-headingDownButton:SetPoint("LEFT", headingUpButton, "RIGHT", 4, 0)
-
-local assignedUpButton = CreateButton(canvas, "Move Up", HALF, function() MoveAssigned(-1) end)
-assignedUpButton:SetPoint("TOPLEFT", assignedList, "BOTTOMLEFT", 0, -6)
-local assignedDownButton = CreateButton(canvas, "Move Down", HALF, function() MoveAssigned(1) end)
-assignedDownButton:SetPoint("LEFT", assignedUpButton, "RIGHT", 4, 0)
-local assignedRenameButton = CreateButton(canvas, "Rename", HALF, function() RenameDatapoint(selectedAssigned) end)
-assignedRenameButton:SetPoint("TOPLEFT", assignedUpButton, "BOTTOMLEFT", 0, -4)
-local removeButton = CreateButton(canvas, "Remove", HALF, function() RemoveAssigned() end)
-removeButton:SetPoint("LEFT", assignedRenameButton, "RIGHT", 4, 0)
-
-local PROMOTE_TOOLTIP = "Show this datapoint at the same level as headings, as if it were its own heading. "
-	.. "It appears in Your headings, where you can move it with Up / Down and put it back with Delete."
-local function AddPromoteTooltip(button)
-	button:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText("Show at Heading Level", 1, 1, 1)
-		GameTooltip:AddLine(PROMOTE_TOOLTIP, nil, nil, nil, true)
-		GameTooltip:Show()
-	end)
-	button:SetScript("OnLeave", GameTooltip_Hide)
-end
-local assignedPromoteButton = CreateButton(canvas, "Show at Heading Level", COLUMN_WIDTH, function() PromoteDatapoint(selectedAssigned) end)
-assignedPromoteButton:SetPoint("TOPLEFT", assignedRenameButton, "BOTTOMLEFT", 0, -4)
-AddPromoteTooltip(assignedPromoteButton)
-
-local addButton = CreateButton(canvas, "<< Add to Heading", COLUMN_WIDTH, function() AddAvailable() end)
-addButton:SetPoint("TOPLEFT", availableList, "BOTTOMLEFT", 0, -6)
-local availableRenameButton = CreateButton(canvas, "Rename", HALF, function() RenameDatapoint(selectedAvailable) end)
-availableRenameButton:SetPoint("TOPLEFT", addButton, "BOTTOMLEFT", 0, -4)
-local forgetButton = CreateButton(canvas, "Forget", HALF, ForgetAvailable)
-forgetButton:SetPoint("LEFT", availableRenameButton, "RIGHT", 4, 0)
-local availablePromoteButton = CreateButton(canvas, "Show at Heading Level", COLUMN_WIDTH, function() PromoteDatapoint(selectedAvailable) end)
-availablePromoteButton:SetPoint("TOPLEFT", availableRenameButton, "BOTTOMLEFT", 0, -4)
-AddPromoteTooltip(availablePromoteButton)
-
-local MUTE_TOOLTIP = "Draw this datapoint in gray, as secondary information, so the lines you care about stand out. "
-	.. "Click again to show it normally."
-local function AddMuteTooltip(button)
-	button:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText(self:GetText(), 1, 1, 1)
-		GameTooltip:AddLine(MUTE_TOOLTIP, nil, nil, nil, true)
-		GameTooltip:Show()
-	end)
-	button:SetScript("OnLeave", GameTooltip_Hide)
-end
-local assignedMuteButton = CreateButton(canvas, "Mute", COLUMN_WIDTH, function() ToggleMuted(GetAssignedTarget()) end)
-assignedMuteButton:SetPoint("TOPLEFT", assignedPromoteButton, "BOTTOMLEFT", 0, -4)
-AddMuteTooltip(assignedMuteButton)
-local availableMuteButton = CreateButton(canvas, "Mute", COLUMN_WIDTH, function() ToggleMuted(selectedAvailable) end)
-availableMuteButton:SetPoint("TOPLEFT", availablePromoteButton, "BOTTOMLEFT", 0, -4)
-AddMuteTooltip(availableMuteButton)
-
-forgetButton:SetScript("OnEnter", function(self)
-	GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-	GameTooltip:SetText("Forget", 1, 1, 1)
-	GameTooltip:AddLine("Remove a datapoint you no longer see from this list. It comes back the next time it appears on a tooltip.", nil, nil, nil, true)
-	GameTooltip:Show()
+SetTooltip(renameButton, "Rename",
+	"Changes the selected heading's name, or the selected datapoint's label on tooltips. "
+	.. "Leave a datapoint's name empty to go back to TSM's.")
+local deleteButton = CreateButton(canvas, "Delete", 84, DeleteSelected)
+deleteButton:SetPoint("LEFT", renameButton, "RIGHT", 4, 0)
+SetTooltip(deleteButton, function(self) return self:GetText() end, function(self)
+	if self:GetText() == "Remove" then
+		return "Takes the datapoint out of your layout and puts it back in Available."
+	end
+	return "Deletes the selected heading or spacer. Its datapoints go back to Available."
 end)
-forgetButton:SetScript("OnLeave", GameTooltip_Hide)
 
-local resetButton = CreateButton(canvas, "Reset Headings", HALF, function()
+local muteButton = CreateButton(canvas, "Mute", 80, ToggleMutedSelected)
+muteButton:SetPoint("TOPLEFT", newButton, "BOTTOMLEFT", 0, -4)
+SetTooltip(muteButton, function(self) return self:GetText() end,
+	"Draws the datapoint in gray, as secondary information, so the lines you care about stand out. "
+	.. "Click again to show it normally.")
+local hideButton = CreateButton(canvas, "Hide", 80, ToggleHiddenSelected)
+hideButton:SetPoint("LEFT", muteButton, "RIGHT", 4, 0)
+SetTooltip(hideButton, function(self) return self:GetText() end,
+	"Moves the datapoint to (Hidden) so it's never shown. Unhide puts it back in Available.")
+local promoteButton = CreateButton(canvas, "Show at Heading Level", TREE_WIDTH - 168, PromoteSelected)
+promoteButton:SetPoint("LEFT", hideButton, "RIGHT", 4, 0)
+SetTooltip(promoteButton, "Show at Heading Level",
+	"Shows the datapoint at the same level as headings, as if it were its own heading. "
+	.. "You can also drag a datapoint between two headings. Drag it into a heading to put it back.")
+
+local forgetButton = CreateButton(canvas, "Forget", AVAILABLE_WIDTH, ForgetSelected)
+forgetButton:SetPoint("TOPLEFT", availableList, "BOTTOMLEFT", 0, -6)
+SetTooltip(forgetButton, "Forget",
+	"Removes a datapoint you no longer see from this list. It comes back the next time it appears on a tooltip.")
+
+local resetButton = CreateButton(canvas, "Reset Headings", 114, function()
 	Confirm("Delete all of your headings and hidden datapoints?\n(Renamed and muted datapoints keep those settings.)", function()
 		ns.ResetAll()
-		selectedHeading, selectedAssigned, selectedAvailable = nil, nil, nil
+		selected = nil
 		Refresh()
 	end)
 end)
@@ -632,90 +645,322 @@ resetButton:SetPoint("TOP", enabledCheck, "TOP", 0, 0)
 resetButton:SetPoint("RIGHT", availableList, "RIGHT", 0, 0)
 
 local hint = canvas:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-hint:SetPoint("TOPLEFT", deleteButton, "BOTTOMLEFT", 0, -64)
-hint:SetWidth(COLUMN_WIDTH * 3 + COLUMN_GAP * 2)
+hint:SetPoint("TOPLEFT", muteButton, "BOTTOMLEFT", 0, -10)
+hint:SetWidth(TOTAL_WIDTH)
 hint:SetJustifyH("LEFT")
-hint:SetText("Tip: double-click an available datapoint to add it, double-click a datapoint in a heading to remove it, "
-	.. "and double-click a heading to rename it. Put a datapoint under (Hidden) to never show it. "
-	.. "Rename a datapoint to change its label on tooltips; leave the name empty to go back to TSM's. "
-	.. "Mute a datapoint to show it in gray as secondary information.")
+hint:SetText("Drag datapoints into a heading, between headings to show them at heading level, "
+	.. "into (Hidden) to never show them, or back to Available. Drag headings and spacers to reorder them. "
+	.. "Double-click a heading or datapoint to rename it.")
+
+-- ============================================================================
+-- Drag and drop
+-- ============================================================================
+
+-- Rows of the layout list by what they show, rebuilt by Refresh. Datapoints
+-- switched off in TSM have no row, so entries and points are ordered lists:
+--   entry = { { index = headingIndex, row = rowIndex }, ... }
+--   point[listKey] = { { pos = position, row = rowIndex }, ... }
+--   empty[listKey] = rowIndex, hidden = rowIndex
+local treeRows = { entry = {}, point = {}, empty = {} }
+
+local ghost = CreateFrame("Frame", nil, UIParent, BACKDROP_TEMPLATE)
+ghost:SetFrameStrata("TOOLTIP")
+ghost:SetSize(180, ROW_HEIGHT + 6)
+if ghost.SetBackdrop then
+	ghost:SetBackdrop(LIST_BACKDROP)
+	ghost:SetBackdropColor(0, 0, 0, 0.85)
+	ghost:SetBackdropBorderColor(1, 0.82, 0)
+end
+ghost.text = ghost:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+ghost.text:SetPoint("LEFT", 8, 0)
+ghost.text:SetPoint("RIGHT", -8, 0)
+ghost.text:SetJustifyH("LEFT")
+ghost.text:SetWordWrap(false)
+ghost:Hide()
+
+-- Insertion line drawn above the rows of the layout list
+local indicator = CreateFrame("Frame", nil, tree.content)
+indicator:SetHeight(2)
+indicator:SetFrameLevel(tree.content:GetFrameLevel() + 10)
+local indicatorTexture = indicator:CreateTexture(nil, "OVERLAY")
+indicatorTexture:SetAllPoints()
+indicatorTexture:SetColorTexture(1, 0.82, 0, 0.9)
+indicator:Hide()
+
+local function CursorY(frame)
+	local _, y = GetCursorPosition()
+	return y / frame:GetEffectiveScale()
+end
+
+---What dropping at the cursor would do in the layout list:
+---  { kind = "top", index = n }           insert in the headings list before entry n
+---  { kind = "into", key = k, pos = p }   insert into heading k (or hidden) at position p
+local function TreeTarget()
+	if not tree.scroll:IsMouseOver() then
+		return nil
+	end
+	local row, hit = nil, false
+	for i = 1, #tree.items do
+		row = tree.rows[i]
+		if row:IsMouseOver() then
+			hit = true
+			break
+		end
+	end
+	if not row then
+		return nil
+	end
+	-- Below the last row counts as the lower half of the last row
+	local upper = hit and CursorY(row) > (row:GetTop() + row:GetBottom()) / 2
+	local drop = row.item.drop
+	if drop.kind == "entry" then
+		if upper then
+			return { kind = "top", index = drop.index }
+		elseif drop.isHeading then
+			return { kind = "into", key = drop.index, pos = 1 }
+		end
+		return { kind = "top", index = drop.index + 1 }
+	elseif drop.kind == "point" then
+		return { kind = "into", key = drop.key, pos = upper and drop.pos or (drop.pos + 1) }
+	elseif drop.kind == "empty" then
+		return { kind = "into", key = drop.key, pos = 1 }
+	elseif drop.kind == "hidden" then
+		if upper then
+			return { kind = "top", index = #ns.db.headings + 1 }
+		end
+		return { kind = "into", key = HIDDEN_KEY, pos = 1 }
+	end
+end
+
+---What dropping the current drag at the cursor would do, or nil for nothing.
+local function DropTarget()
+	if availableList:IsMouseOver() then
+		-- Back to Available: only for datapoints that are in the layout
+		if drag.id and ns.GetAssignment()[drag.id] ~= nil then
+			return { kind = "unassign" }
+		end
+		return nil
+	end
+	local target = TreeTarget()
+	if target and drag.entry and target.kind == "into" then
+		-- Headings and spacers can't go inside a heading: put them after it
+		if target.key == HIDDEN_KEY then
+			target = { kind = "top", index = #ns.db.headings + 1 }
+		else
+			target = { kind = "top", index = target.key + 1 }
+		end
+	end
+	return target
+end
+
+local function ShowIndicator(target)
+	indicator:Hide()
+	if availableList.SetBackdropBorderColor then
+		local unassign = target and target.kind == "unassign"
+		availableList:SetBackdropBorderColor(unassign and 1 or 0.4, unassign and 0.82 or 0.4, unassign and 0 or 0.4)
+	end
+	if not target or target.kind == "unassign" then
+		return
+	end
+	-- Rows are listed with their real list position; the line goes above the
+	-- first shown row at or after the target position.
+	local rowIndex, edge, indent
+	if target.kind == "top" then
+		rowIndex, edge, indent = treeRows.hidden, "TOP", 0
+		for _, entry in ipairs(treeRows.entry) do
+			if entry.index >= target.index then
+				rowIndex = entry.row
+				break
+			end
+		end
+	else
+		local points = treeRows.point[target.key] or {}
+		indent = POINT_INDENT - 4
+		for _, point in ipairs(points) do
+			if point.pos >= target.pos then
+				rowIndex, edge = point.row, "TOP"
+				break
+			end
+		end
+		if not rowIndex then
+			if #points > 0 then
+				rowIndex, edge = points[#points].row, "BOTTOM"
+			else
+				rowIndex, edge = treeRows.empty[target.key], "TOP"
+			end
+		end
+	end
+	local row = rowIndex and tree.rows[rowIndex]
+	if not row then
+		return
+	end
+	indicator:ClearAllPoints()
+	indicator:SetPoint("LEFT", row, edge .. "LEFT", indent, 0)
+	indicator:SetPoint("RIGHT", row, edge .. "RIGHT", 0, 0)
+	indicator:Show()
+end
+
+---Scrolls the layout list while dragging near its top or bottom edge.
+local function AutoScroll(elapsed)
+	local scroll = tree.scroll
+	local scale = scroll:GetEffectiveScale()
+	local x, y = GetCursorPosition()
+	x, y = x / scale, y / scale
+	if x < scroll:GetLeft() or x > scroll:GetRight() then
+		return
+	end
+	local direction
+	if y > scroll:GetTop() - AUTOSCROLL_EDGE and y < scroll:GetTop() + AUTOSCROLL_EDGE then
+		direction = -1
+	elseif y < scroll:GetBottom() + AUTOSCROLL_EDGE and y > scroll:GetBottom() - AUTOSCROLL_EDGE then
+		direction = 1
+	else
+		return
+	end
+	local offset = scroll:GetVerticalScroll() + direction * AUTOSCROLL_SPEED * elapsed
+	offset = min(max(offset, 0), scroll:GetVerticalScrollRange())
+	if scroll.ScrollBar then
+		scroll.ScrollBar:SetValue(offset)
+	else
+		scroll:SetVerticalScroll(offset)
+	end
+end
+
+local function StopDrag()
+	drag = nil
+	ghost:Hide()
+	ShowIndicator(nil)
+end
+
+local function ApplyDrop(source, target)
+	if target.kind == "unassign" then
+		ns.Unassign(source.id)
+	elseif target.kind == "top" then
+		if source.entry then
+			MoveEntry(source.entry, target.index)
+		else
+			MovePointToTop(source.id, target.index)
+		end
+	else
+		MovePointInto(source.id, target.key, target.pos)
+	end
+	selected = source.id or source.entry
+	Changed()
+end
+
+StartDrag = function(source, text)
+	GameTooltip:Hide()
+	drag = source
+	ghost.text:SetText(text)
+	ghost:SetWidth(min(max(ghost.text:GetStringWidth() + 20, 80), 260))
+	ghost:Show()
+end
+
+FinishDrag = function()
+	if not drag then
+		return
+	end
+	local source, target = drag, DropTarget()
+	StopDrag()
+	-- Switched off in TSM during the drag: it's no longer shown, so don't place it
+	if target and not (source.id and not ns.IsDatapointActive(source.id)) then
+		ApplyDrop(source, target)
+	end
+end
+
+ghost:SetScript("OnUpdate", function(self, elapsed)
+	if not drag then
+		self:Hide()
+		return
+	end
+	if not IsMouseButtonDown("LeftButton") then
+		-- In case OnDragStop never reached the row (e.g. it was hidden mid-drag)
+		FinishDrag()
+		return
+	end
+	local x, y = GetCursorPosition()
+	local scale = UIParent:GetEffectiveScale()
+	self:ClearAllPoints()
+	self:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", x / scale + 14, y / scale - 10)
+	AutoScroll(elapsed)
+	ShowIndicator(DropTarget())
+end)
 
 -- ============================================================================
 -- Refresh
 -- ============================================================================
 
-local GRAY = { 0.6, 0.6, 0.6 }
-local WHITE = { 1, 1, 1 }
+local function AddRow(items, item)
+	tinsert(items, item)
+	return #items
+end
 
-Refresh = function()
-	if not canvas:IsVisible() or not ns.db then
-		return
-	end
+local function BuildTree()
 	local db = ns.db
-	if selectedHeading and selectedHeading ~= HIDDEN_KEY and not db.headings[selectedHeading] then
-		selectedHeading = nil
+	local items = {}
+	treeRows = { entry = {}, point = {}, empty = {} }
+
+	-- Datapoints switched off in TSM's tooltip settings are left out, but keep
+	-- their place in the lists, so drop positions use the real list positions.
+	local function AddPoints(key, list, emptyText)
+		local rows = {}
+		treeRows.point[key] = rows
+		for pos, id in ipairs(list) do
+			if ns.IsDatapointActive(id) then
+				local row = DatapointRow(id, POINT_INDENT)
+				row.drop = { kind = "point", key = key, pos = pos }
+				tinsert(rows, { pos = pos, row = AddRow(items, row) })
+			end
+		end
+		if #rows == 0 then
+			treeRows.empty[key] = AddRow(items, { text = emptyText, color = DIM, indent = POINT_INDENT,
+				inert = true, drop = { kind = "empty", key = key } })
+		end
 	end
 
-	enabledCheck:Update()
-	unassignedCheck:Update()
+	local function AddEntry(index, item)
+		tinsert(treeRows.entry, { index = index, row = AddRow(items, item) })
+	end
 
-	-- Headings
-	local items = {
-		{ key = HIDDEN_KEY, text = format("(Hidden)  [%d]", #db.hidden), color = GRAY,
-			tooltip = "Datapoints placed here are never shown on tooltips." },
-	}
 	for index, heading in ipairs(db.headings) do
+		local drop = { kind = "entry", index = index }
 		if heading.spacer then
-			tinsert(items, { key = index, text = "- - - spacer - - -", color = GRAY,
-				tooltip = "A blank line between the headings above and below." })
+			AddEntry(index, { text = "- - - spacer - - -", color = GRAY,
+				font = "GameFontHighlightSmall", sel = heading, drag = { entry = heading }, drop = drop,
+				tooltipTitle = "Spacer", tooltip = "A blank line between the headings above and below." })
 		elseif heading.standalone then
 			local id = heading.items[1]
-			local name, section = DisplayName(id)
-			local muted = ns.IsMuted(id)
-			tinsert(items, { key = index, text = "|cff808080>|r " .. name, color = muted and GRAY or WHITE,
-				tooltip = "Datapoint shown at heading level" .. (section and (" (from " .. section .. ")") or "") .. "."
-					.. (muted and "\nShown muted" or "") })
+			if ns.IsDatapointActive(id) then
+				local row = DatapointRow(id, HEADING_INDENT)
+				local _, section = DisplayName(id)
+				row.text = "|cff808080>|r " .. row.text
+				row.font = "GameFontNormal"
+				row.color = ns.IsMuted(id) and GRAY or GOLD
+				row.tooltip = "Shown at heading level" .. (section and (" (from " .. section .. ")") or "") .. "."
+					.. (ns.IsMuted(id) and "\nShown muted" or "")
+				row.drop = drop
+				AddEntry(index, row)
+			end
 		else
-			tinsert(items, { key = index, text = format("%s  [%d]", heading.name, #heading.items), color = WHITE })
+			drop.isHeading = true
+			AddEntry(index, { text = heading.name, color = GOLD, font = "GameFontNormal",
+				sel = heading, drag = { entry = heading }, drop = drop })
+			AddPoints(index, heading.items, "Drag datapoints here")
 		end
 	end
-	headingList:SetItems(items, selectedHeading)
 
-	-- Datapoints in the selected heading
-	local list = GetSelectedList()
-	if selectedAssigned and not (list and IndexOf(list, selectedAssigned)) then
-		selectedAssigned = nil
-	end
-	items = {}
-	if list then
-		for _, id in ipairs(list) do
-			tinsert(items, DatapointRow(id))
-		end
-	end
-	local selectedIsSpacer = GetSelectedHeading() and GetSelectedHeading().spacer
-	local selectedIsStandalone = GetSelectedHeading() and GetSelectedHeading().standalone
-	if selectedHeading == HIDDEN_KEY then
-		assignedList.title:SetText("Hidden datapoints")
-	elseif selectedIsSpacer then
-		assignedList.title:SetText("Spacer")
-	elseif selectedIsStandalone then
-		assignedList.title:SetText("Heading-level datapoint")
-	elseif list then
-		assignedList.title:SetText("In \"" .. db.headings[selectedHeading].name .. "\"")
-	else
-		assignedList.title:SetText("Datapoints in heading")
-	end
-	assignedList:SetItems(items, selectedAssigned,
-		list and "Add datapoints from the list on the right."
-			or selectedIsSpacer and "Spacers add a blank line and don't hold datapoints. Use Up / Down to position it."
-			or selectedIsStandalone and "This datapoint is shown at heading level. Use Up / Down to position it, Rename to change its label, and Delete to put it back."
-			or "Select a heading, or create one with New.")
+	treeRows.hidden = AddRow(items, { text = "(Hidden)", color = GRAY, font = "GameFontNormal", inert = true,
+		drop = { kind = "hidden" } })
+	AddPoints(HIDDEN_KEY, db.hidden, "Drag datapoints here to never show them")
+	return items
+end
 
-	-- Available (unassigned) datapoints, grouped by TSM section
+local function BuildAvailable()
+	local db = ns.db
 	local assignment = ns.GetAssignment()
 	local bySection, sectionNames = {}, {}
 	for id, entry in pairs(db.catalog) do
-		if assignment[id] == nil then
+		if assignment[id] == nil and ns.IsDatapointActive(id) then
 			local section = entry.section or "?"
 			if not bySection[section] then
 				bySection[section] = {}
@@ -724,50 +969,108 @@ Refresh = function()
 			tinsert(bySection[section], id)
 		end
 	end
-	if selectedAvailable and assignment[selectedAvailable] ~= nil then
-		selectedAvailable = nil
-	end
 	sort(sectionNames)
-	items = {}
+	local items = {}
 	for _, section in ipairs(sectionNames) do
-		tinsert(items, { key = section, text = section, isHeader = true })
+		tinsert(items, { text = section, color = GOLD, font = "GameFontNormalSmall", indent = 2, inert = true })
 		local rows = {}
 		for _, id in ipairs(bySection[section]) do
-			tinsert(rows, DatapointRow(id, true))
+			tinsert(rows, DatapointRow(id, 12))
 		end
 		sort(rows, function(a, b) return a.sortName < b.sortName end)
 		for _, row in ipairs(rows) do
 			tinsert(items, row)
 		end
 	end
-	availableList:SetItems(items, selectedAvailable,
+	return items
+end
+
+---The datapoints currently switched off in TSM's tooltip settings, as a string
+---that changes whenever one is switched on or off.
+local function InactiveSignature()
+	local off = {}
+	for id in pairs(ns.db.catalog) do
+		if not ns.IsDatapointActive(id) then
+			off[id] = true
+		end
+	end
+	for id in pairs(ns.GetAssignment()) do
+		if not ns.IsDatapointActive(id) then
+			off[id] = true
+		end
+	end
+	local ids = {}
+	for id in pairs(off) do
+		tinsert(ids, id)
+	end
+	sort(ids)
+	return table.concat(ids, "\n")
+end
+
+local lastSignature = nil
+
+Refresh = function()
+	if not canvas:IsVisible() or not ns.db then
+		return
+	end
+	local db = ns.db
+	local assignment = ns.GetAssignment()
+	lastSignature = InactiveSignature()
+
+	-- Drop a selection that no longer exists
+	if type(selected) == "table" and not IndexOf(db.headings, selected) then
+		selected = nil
+	elseif type(selected) == "string" and ((assignment[selected] == nil and not db.catalog[selected])
+		or not ns.IsDatapointActive(selected)) then
+		selected = nil
+	end
+
+	enabledCheck:Update()
+	unassignedCheck:Update()
+	keepPlacementCheck:Update()
+
+	tree:SetItems(BuildTree())
+	availableList:SetItems(BuildAvailable(),
 		next(db.catalog) and "Everything has been placed." or "Hover over some items to discover TSM's datapoints.")
 
 	-- Button states
-	local hasHeading = selectedHeading and selectedHeading ~= HIDDEN_KEY
-	renameButton:SetEnabled(hasHeading and not selectedIsSpacer or false)
-	deleteButton:SetEnabled(hasHeading and true or false)
-	headingUpButton:SetEnabled(hasHeading and selectedHeading > 1 or false)
-	headingDownButton:SetEnabled(hasHeading and selectedHeading < #db.headings or false)
-	local assignedIndex = list and selectedAssigned and IndexOf(list, selectedAssigned)
-	assignedUpButton:SetEnabled(assignedIndex and assignedIndex > 1 or false)
-	assignedDownButton:SetEnabled(assignedIndex and assignedIndex < #list or false)
-	removeButton:SetEnabled(assignedIndex and true or false)
-	assignedRenameButton:SetEnabled(assignedIndex and true or false)
-	availableRenameButton:SetEnabled(selectedAvailable and true or false)
-	assignedPromoteButton:SetEnabled(assignedIndex and true or false)
-	availablePromoteButton:SetEnabled(selectedAvailable and true or false)
-	addButton:SetEnabled((list and selectedAvailable) and true or false)
-	forgetButton:SetEnabled(selectedAvailable and true or false)
-	local assignedTarget = (assignedIndex and selectedAssigned) or (selectedIsStandalone and GetSelectedHeading().items[1]) or nil
-	assignedMuteButton:SetEnabled(assignedTarget and true or false)
-	assignedMuteButton:SetText(assignedTarget and ns.IsMuted(assignedTarget) and "Unmute" or "Mute")
-	availableMuteButton:SetEnabled(selectedAvailable and true or false)
-	availableMuteButton:SetText(selectedAvailable and ns.IsMuted(selectedAvailable) and "Unmute" or "Mute")
+	local entry, id = SelectedEntry(), SelectedId()
+	local where = id and assignment[id] -- heading index, true (hidden) or nil (available)
+	renameButton:SetEnabled((entry and not entry.spacer) or id ~= nil)
+	deleteButton:SetText((id and "Remove") or "Delete")
+	deleteButton:SetEnabled(entry ~= nil or where ~= nil)
+	muteButton:SetEnabled(id ~= nil)
+	muteButton:SetText(id and ns.IsMuted(id) and "Unmute" or "Mute")
+	hideButton:SetEnabled(id ~= nil)
+	hideButton:SetText(where == true and "Unhide" or "Hide")
+	promoteButton:SetEnabled(id ~= nil and not StandaloneIndex(id))
+	forgetButton:SetEnabled(id ~= nil and where == nil)
 end
 
 canvas:SetScript("OnShow", Refresh)
-ns.OnCatalogChanged = Refresh
+canvas:SetScript("OnHide", StopDrag)
+
+-- TSM's settings window saves changes straight away, so while the panel is
+-- open, check now and then whether a datapoint was switched on or off there.
+local SETTINGS_CHECK_INTERVAL = 0.5
+local sinceCheck = 0
+canvas:SetScript("OnUpdate", function(_, elapsed)
+	sinceCheck = sinceCheck + elapsed
+	if sinceCheck < SETTINGS_CHECK_INTERVAL or drag or not ns.db then
+		return
+	end
+	sinceCheck = 0
+	if InactiveSignature() ~= lastSignature then
+		Refresh()
+	end
+end)
+ns.OnCatalogChanged = function()
+	-- Don't rebuild the rows under an active drag
+	if not drag then
+		Refresh()
+	end
+end
+ns.RefreshOptions = ns.OnCatalogChanged
 
 -- ============================================================================
 -- Registration

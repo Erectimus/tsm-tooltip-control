@@ -15,6 +15,9 @@ local function NewDefaults()
 		-- Datapoints that are not assigned to one of your headings stay under
 		-- their original TSM heading when true, and are dropped when false.
 		showUnassigned = true,
+		-- Datapoints switched off in TSM's tooltip settings keep their place in
+		-- your layout when true, and are taken out of it when false.
+		keepDisabledPlacement = false,
 		-- Ordered list of { name = "Heading", items = { id, id, ... } }
 		-- or { spacer = true, items = {} } for a blank line between headings
 		-- or { standalone = true, items = { id } } for one datapoint shown at heading level
@@ -84,6 +87,30 @@ function ns.Unassign(id)
 			tremove(ns.db.headings, index)
 		end
 	end
+end
+
+---Takes datapoints that are switched off in TSM's tooltip settings out of your
+---headings and the hidden list, unless the user chose to keep their place.
+---@return boolean changed Whether anything was taken out
+function ns.ForgetInactivePlacements()
+	if not ns.db or ns.db.keepDisabledPlacement then
+		return false
+	end
+	local changed = false
+	-- Unassign edits the lists, not this lookup table, so iterating it is safe
+	for id in pairs(ns.GetAssignment()) do
+		if not ns.IsDatapointActive(id) then
+			ns.Unassign(id)
+			changed = true
+		end
+	end
+	if changed then
+		ns.InvalidateLayout()
+		if ns.RefreshOptions then
+			ns.RefreshOptions()
+		end
+	end
+	return changed
 end
 
 ---Shows a datapoint at heading level, inserted at `index` in the headings list.
@@ -181,6 +208,10 @@ eventFrame:SetScript("OnEvent", function(self, event, arg)
 		-- TSM installs its tooltip hook during its own ADDON_LOADED / PLAYER_LOGIN
 		-- handling, so wait one frame to be sure our "finish" hook lands after it.
 		C_Timer.After(0, ns.InstallFinishHook)
+		-- TSM saves tooltip setting changes straight away; notice them even
+		-- while the options panel is closed.
+		ns.ForgetInactivePlacements()
+		C_Timer.NewTicker(1, ns.ForgetInactivePlacements)
 		self:UnregisterEvent("PLAYER_LOGIN")
 	end
 end)
